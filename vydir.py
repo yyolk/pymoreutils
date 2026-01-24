@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-import sys
-import os
+
 import argparse
-import tempfile
-import subprocess
-import shlex
+import os
 import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="vydir - edit directories and filenames",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -27,40 +29,36 @@ Examples:
     )
     args = parser.parse_args()
 
-    files = []
+    files: list[str] = []
     read_stdin = False
 
     # 1. Collect Files
     for item in args.paths:
         if item == "-":
             if not read_stdin:
-                # Read from stdin
                 try:
                     files.extend(line.rstrip("\n") for line in sys.stdin)
                 except UnicodeDecodeError:
                     sys.stderr.write("vydir: Error reading non-UTF8 input from stdin\n")
                     sys.exit(1)
                 read_stdin = True
-        elif os.path.isdir(item):
-            # Strip trailing slash for consistency
-            clean_item = item.rstrip(os.sep)
-            if not clean_item:
-                clean_item = os.sep
-            try:
-                # non-recursive list, sorted
-                contents = sorted(os.listdir(clean_item))
-                files.extend(os.path.join(clean_item, f) for f in contents)
-            except OSError as e:
-                sys.stderr.write(f"vydir: cannot read {item}: {e}\n")
-                sys.exit(1)
         else:
-            files.append(item)
+            path = Path(item)
+            if path.is_dir():
+                try:
+                    # non-recursive, sorted by name
+                    contents = sorted(path.iterdir(), key=lambda p: p.name)
+                    files.extend(str(p) for p in contents)
+                except OSError as e:
+                    sys.stderr.write(f"vydir: cannot read {item}: {e}\n")
+                    sys.exit(1)
+            else:
+                files.append(item)
 
     if not files:
         sys.exit(0)
 
     # 2. Check Control Characters
-    # Perl's [[:cntrl:]] includes 0-31 and 127.
     for f in files:
         if any((ord(c) < 32 and c != "\n") or ord(c) == 127 for c in f):
             sys.stderr.write(
@@ -69,55 +67,63 @@ Examples:
             sys.exit(1)
 
     # 3. Create Temp File
-    # Map ID -> Filename. IDs start at 1.
-    # We use a dict to track the *current* location of files (handled files are removed)
-    items = {i + 1: f for i, f in enumerate(files)}
+    # Map ID -> Path. IDs start at 1.
+    items = {i + 1: Path(f) for i, f in enumerate(files)}
 
     # Calculate zero-padding width
     width = len(str(len(files)))
 
-    tf_fd, tf_path = tempfile.mkstemp(prefix="dir", text=True)
+    temp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="vydir-",
+        delete=False,
+    )
+    temp_path = Path(temp_file.name)
+
     try:
-        with os.fdopen(tf_fd, "w") as tf:
+        with temp_file:
             for i in range(1, len(files) + 1):
                 # Format: ID [TAB] Filename
-                tf.write(f"{i:0{width}d}\t{items[i]}\n")
+                temp_file.write(f"{i:0{width}d}\t{items[i]}\n")
 
         # 4. Run Editor
-        editor_cmd = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+        editor_cmd = os.getenv("EDITOR") or os.getenv("VISUAL") or "vi"
         editor_args = shlex.split(editor_cmd)
-        editor_args.append(tf_path)
+        editor_args.append(str(temp_path))
 
-        # We must explicitly open /dev/tty for the editor if our stdin is a pipe
+        # Explicitly open /dev/tty for the editor if possible
+        tty_path = Path("/dev/tty")
         try:
-            with open("/dev/tty", "r") as tty_in, open("/dev/tty", "w") as tty_out:
-                subprocess.check_call(
-                    editor_args, stdin=tty_in, stdout=tty_out, stderr=tty_out
+            with tty_path.open("r") as tty_in, tty_path.open("w") as tty_out:
+                subprocess.run(
+                    editor_args,
+                    stdin=tty_in,
+                    stdout=tty_out,
+                    stderr=tty_out,
+                    check=True,
                 )
         except OSError:
-            # Fallback if no TTY available (e.g. running in cron or non-interactive shell)
-            # If we read from stdin (-), we can't reuse sys.stdin.
+            # Fallback if no TTY available
             if read_stdin:
                 sys.stderr.write(
                     "vydir: Cannot launch interactive editor: input is piped and /dev/tty is unavailable.\n"
                 )
                 sys.exit(1)
-            # Otherwise try standard inheritance
-            subprocess.check_call(editor_args)
+            # Otherwise inherit stdio
+            subprocess.run(editor_args, check=True)
         except subprocess.CalledProcessError:
             sys.stderr.write(f"vydir: {editor_cmd} exited nonzero, aborting\n")
             sys.exit(1)
 
         # 5. Read Result
-        with open(tf_path, "r") as tf:
-            lines = tf.readlines()
+        lines = temp_path.read_text(encoding="utf-8").splitlines()
 
     finally:
-        if os.path.exists(tf_path):
-            os.remove(tf_path)
+        if temp_path.exists():
+            temp_path.unlink()
 
     # 6. Apply Changes
-    # Regex to parse lines: integer ID, optional tab/space, filename
     line_re = re.compile(r"^(\d+)\s*\t?(.*)")
     error_occurred = False
 
@@ -138,96 +144,86 @@ Examples:
             sys.stderr.write(f"vydir: unknown item number {num}\n")
             sys.exit(1)
 
-        original_name = items[num]
+        original_path = items[num]
 
-        # If the name has changed (and isn't empty)
-        if name != original_name:
+        if name != str(original_path):
             if not name:
-                # If name is cleared but ID remains, treat as ignore (or delete?)
-                # vidir keeps the item in the dict, which means it falls through to the deletion loop below.
+                # Empty name → treat as deletion (item remains in dict)
                 continue
 
-            src = original_name
-            dest = name
+            src = original_path
+            dest = Path(name)
 
             # Sanity check: does src exist?
-            if not (os.path.exists(src) or os.path.islink(src)):
+            if not (src.exists() or src.is_symlink()):
                 sys.stderr.write(f"vydir: {src} does not exist\n")
                 del items[num]
                 continue
 
             # Swap Handling: If dest exists, move it to dest~
-            if os.path.exists(dest) or os.path.islink(dest):
-                tmp = dest + "~"
+            if dest.exists() or dest.is_symlink():
+                backup = dest.with_name(dest.name + "~")
                 c = 0
-                while os.path.exists(tmp) or os.path.islink(tmp):
+                while backup.exists() or backup.is_symlink():
                     c += 1
-                    tmp = f"{dest}~{c}"
+                    backup = dest.with_name(dest.name + f"~{c}")
 
                 try:
-                    os.rename(dest, tmp)
+                    dest.rename(backup)
                     if args.verbose:
-                        print(f"'{dest}' -> '{tmp}'")
+                        print(f"'{dest}' -> '{backup}'")
 
-                    # Update internal map: whatever ID pointed to 'dest' now points to 'tmp'
-                    # This ensures we don't try to rename 'dest' later thinking it's still there.
+                    # Update internal map
                     for k, v in items.items():
                         if v == dest:
-                            items[k] = tmp
+                            items[k] = backup
                 except OSError as e:
-                    sys.stderr.write(f"vydir: failed to rename {dest} to {tmp}: {e}\n")
+                    sys.stderr.write(f"vydir: failed to rename {dest} to {backup}: {e}\n")
                     error_occurred = True
 
             # Create parent directories if missing
-            dest_dir = os.path.dirname(dest)
-            if dest_dir and not os.path.exists(dest_dir):
+            if dest.parent != Path(".") and not dest.parent.exists():
                 try:
-                    os.makedirs(dest_dir, exist_ok=True)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
                 except OSError as e:
                     sys.stderr.write(
-                        f"vydir: failed to create directory tree {dest_dir}: {e}\n"
+                        f"vydir: failed to create directory tree {dest.parent}: {e}\n"
                     )
                     error_occurred = True
 
             # Perform Rename
             try:
-                os.rename(src, dest)
+                src.rename(dest)
                 if args.verbose:
                     print(f"'{src}' => '{dest}'")
 
-                # Recursive Update Logic:
-                # If we renamed a directory, we must update the paths of any files
-                # inside it that are still waiting in the 'items' dict.
-                if os.path.isdir(dest):
-                    src_slash = src + os.sep
-                    len_src = len(src)
+                # Recursive Update Logic for directory renames
+                if dest.is_dir():
                     for k, v in items.items():
                         if v == src:
                             continue
-                        if v.startswith(src_slash):
-                            suffix = v[len_src:]  # e.g. "/subdir/file"
-                            items[k] = dest + suffix
+                        if v.is_relative_to(src):
+                            rel = v.relative_to(src)
+                            items[k] = dest / rel
 
             except OSError as e:
                 sys.stderr.write(f"vydir: failed to rename {src} to {dest}: {e}\n")
                 error_occurred = True
 
-        # Remove processed item from dict
+        # Remove processed item
         del items[num]
 
     # 7. Process Deletions
-    # Any item remaining in 'items' was removed from the text file by the user.
-    # We sort reverse alphabetically. This acts as a depth-first sort
-    # (e.g., "a/b" comes before "a" in reverse), ensuring children are deleted before parents.
-    to_delete = sorted(items.values(), reverse=True)
+    # Remaining items were removed by the user → delete them.
+    # Sort reverse alphabetically for depth-first deletion.
+    to_delete = sorted(items.values(), key=str, reverse=True)
 
     for item in to_delete:
         try:
-            # Use rmdir for directories (safety: only works if empty), remove for files
-            if os.path.isdir(item) and not os.path.islink(item):
-                os.rmdir(item)
+            if item.is_dir() and not item.is_symlink():
+                item.rmdir()
             else:
-                os.remove(item)
+                item.unlink()
             if args.verbose:
                 print(f"removed '{item}'")
         except OSError as e:
