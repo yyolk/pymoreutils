@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pymoreutils"
+version = "0.0.1"
+description = "Python implementations of select moreutils tools (vype, vydir)"
+readme = "README.md"
+requires-python = ">=3.8"
+keywords = ["moreutils", "vipe", "vidir", "cli", "utilities", "xonsh"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+    "Topic :: Utilities",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+]
+
+[project.scripts]
+vype = "vype:main"
+vydir = "vydir:main"
+
+[project.urls]
+Repository = "https://github.com/yyolk/pymoreutils"  # Update if different
