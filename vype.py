@@ -1,87 +1,83 @@
-#!/usr/bin/env python
-import sys
-import os
+#!/usr/bin/env python3
+
 import argparse
-import tempfile
-import subprocess
+import os
 import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="vype - edit pipe", usage="%(prog)s [--suffix=extension]"
+        description="vype - edit stdin via $EDITOR and write the result to stdout",
+        usage="%(prog)s [--suffix=extension]",
     )
     parser.add_argument(
         "--suffix",
-        help="Optional extension for the temp file (e.g., .csv, .json) "
-        "to enable syntax highlighting in editors.",
+        help="Optional file extension for the temporary file (e.g. '.csv', '.json') "
+             "to enable syntax highlighting in the editor.",
     )
     args = parser.parse_args()
 
-    # Handle suffix formatting
-    suffix = args.suffix if args.suffix else ""
+    suffix = args.suffix or ""
     if suffix and not suffix.startswith("."):
-        suffix = "." + suffix
+        suffix = f".{suffix}"
 
-    # 1. Read Input
-    # We use binary mode for stdin/stdout to handle all data types safely without
-    # encoding crashes.
+    # Read all input (binary-safe)
     input_data = b""
     if not sys.stdin.isatty():
         try:
             input_data = sys.stdin.buffer.read()
         except Exception as e:
-            sys.stderr.write(f"vype: Error reading stdin: {e}\n")
+            sys.stderr.write(f"vype: error reading stdin: {e}\n")
             sys.exit(1)
 
-    # 2. Create Temp File
-    # mkstemp returns a low-level file handle (int) and the absolute path (str)
-    fd, temp_path = tempfile.mkstemp(suffix=suffix)
+    # Create temporary file
+    temp_file = tempfile.NamedTemporaryFile(mode="w+b", suffix=suffix, delete=False)
+    temp_path = Path(temp_file.name)
 
     try:
-        # Write input data to the temp file
-        with os.fdopen(fd, "wb") as tmp:
-            tmp.write(input_data)
+        with temp_file:
+            temp_file.write(input_data)
 
-        # 3. Determine Editor
-        # Priority: EDITOR env var -> VISUAL env var -> 'vi'
-        editor_cmd = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
-
-        # Split command string into list (e.g. "vim -c 'set noswapfile'" -> args)
+        # Determine editor command
+        editor_cmd = os.getenv("EDITOR") or os.getenv("VISUAL") or "vi"
         editor_args = shlex.split(editor_cmd)
-        editor_args.append(temp_path)
+        editor_args.append(str(temp_path))
 
-        # 4. Spawn Editor
-        # We must explicitly connect the editor's stdin/out/err to /dev/tty
-        # because the script's stdin/out might be pipes.
+        # Launch editor with explicit tty handling
+        tty_path = Path("/dev/tty")
         try:
-            with open("/dev/tty", "r") as tty_in, open("/dev/tty", "w") as tty_out:
-                subprocess.check_call(
-                    editor_args, stdin=tty_in, stdout=tty_out, stderr=tty_out
+            with tty_path.open("r") as tty_in, tty_path.open("w") as tty_out:
+                subprocess.run(
+                    editor_args,
+                    stdin=tty_in,
+                    stdout=tty_out,
+                    stderr=tty_out,
+                    check=True,
                 )
-        except OSError:
+        except OSError as e:
             sys.stderr.write(
-                "vype: Error opening /dev/tty. Are you running this interactively?\n"
+                f"vype: cannot open /dev/tty ({e}). Is this command running interactively?\n"
             )
             sys.exit(1)
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
             sys.stderr.write(
-                f"vype: Editor '{editor_cmd}' exited with non-zero status.\n"
+                f"vype: editor '{editor_cmd}' exited with status {e.returncode}\n"
             )
             sys.exit(1)
 
-        # 5. Read Result and Output
-        with open(temp_path, "rb") as f:
-            output_data = f.read()
-
-        # Write binary data to stdout buffer to avoid newline translation issues
+        # Output the edited content (binary-safe)
+        output_data = temp_path.read_bytes()
         sys.stdout.buffer.write(output_data)
         sys.stdout.buffer.flush()
 
     finally:
-        # 6. Cleanup
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        # Clean up the temporary file
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 if __name__ == "__main__":
