@@ -23,4 +23,4 @@ vype = "vype:main"
 vydir = "vydir:main"
 
 [project.urls]
-Repository = "https://github.com/yyolk/pymoreutils"  # Update if different
+Repository = "https://github.com/yyolk/pymoreutils"
